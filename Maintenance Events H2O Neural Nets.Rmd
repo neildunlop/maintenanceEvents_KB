@@ -1,0 +1,641 @@
+---
+title: "Serco Maintenance Event Modelling - H20 Neural Nets"
+output: html_notebook
+---
+
+*Import Libraries*
+```{r}
+library("tidyverse")
+library("dplyr")
+library("plyr")
+library(lubridate)
+library(stringr)
+library(caret)
+library(hydroGOF)
+library(gbm)
+library(xgboost)
+library(glmnet)
+library("FactoMineR")
+library("factoextra")
+library(corrplot)
+
+library(caret)
+library(corrplot)
+library(xgboost)
+library(stats)
+library(knitr)
+library(ggplot2)
+library(Matrix)
+library(plotly)
+library(htmlwidgets)
+library(readr)
+library(randomForest)
+library(data.table)
+library(h2o)
+library(dplyr)
+library(tidyr)
+```
+
+Load maintenance events which includes data on the nature of the fault, the fix information and the costs.
+```{r}
+#load the fault fix data
+rawMaintenanceEvents <- read.csv("csv/Fault Fixed - Costings - Modified.csv", skip=0, stringsAsFactors = FALSE)
+nrow(rawMaintenanceEvents)
+
+#rename 'Address', 'Accommodation.Type' and 'Housing.Officer' fields because they are common to both datasets we will join
+names(rawMaintenanceEvents)[names(rawMaintenanceEvents)=="Address"] <- "Event.Address"
+names(rawMaintenanceEvents)[names(rawMaintenanceEvents)=="Accommodation.Type"] <- "Event.Accommodation.Type"
+names(rawMaintenanceEvents)[names(rawMaintenanceEvents)=="Housing.Officer"] <- "Event.Housing.Officer"
+
+
+#convert 'Identified.date' date strings to actual dates - We use the lubridate package to parse the datetimes and we use the very useful parse_date_time method because it allow us to specify different format patterns.  This is needed because some of the values in the 'identified date' column have seconds and some dont.  The first format is used for the parsing and if that fails, the second format is used.  Beware that if we just used the second format on a datetime with no seconds it wouldn't error but it would produce the wrong result (the year would be 2020.. which is totally wrong).
+#See (https://skgrange.github.io/date_handling.html) for more information.
+rawMaintenanceEvents <- mutate(rawMaintenanceEvents, Identified.date= parse_date_time(Identified.date, orders = c("dmy_HM", "dmy_HMS"), tz = "UTC"))
+nrow(rawMaintenanceEvents)
+
+#filter to only keep events identified in 2017
+#we exclude 2422 rows that have a blank Identified Date or an Identified date that is in 2016
+filteredMaintenanceEvents <- filter(rawMaintenanceEvents, Identified.date >= dmy_hms("01-01-2017 00:00:00"))
+nrow(filteredMaintenanceEvents)
+```
+
+```{r}
+#127 rows have invalid ASYS value,including blanks -29 without blanks with values of (DON'T USE, DUPLICATE, DUPLICATE ARCHIVED, TBC)
+invalidAsysRows <- subset(filteredMaintenanceEvents, is.na(as.numeric(as.character(filteredMaintenanceEvents$ASYS))),)
+nrow(invalidAsysRows)
+
+#Do the conversion of ASYS numbers to actual numbers.  Anything which doesn't convert to a number is an error (should be 127)
+filteredMaintenanceEvents <- mutate(filteredMaintenanceEvents, ASYS= as.numeric(as.character(filteredMaintenanceEvents$ASYS)))
+nrow(filteredMaintenanceEvents)
+```
+
+```{r}
+#There are some non-numeric ASYS numbers.  Convert them to numeric and exlcude those that dont parse.
+validAsysMaintenanceEvents <- filter(filteredMaintenanceEvents, !is.na(as.numeric(as.character(filteredMaintenanceEvents$ASYS))),)
+nrow(validAsysMaintenanceEvents)
+
+# 26 rows with 2017 and non-numeric values in ASYS  (Excel agrees)
+# 98 rows with 2017 and blank ASYS  (Excel agrees)
+
+```
+
+
+```{r}
+#There is no property data for January so we'll won't use it
+validAsysMaintenanceEventsJan <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 1,]
+```
+
+```{r}
+validAsysMaintenanceEventsFeb <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 2,]
+validAsysMaintenanceEventsMar <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 3,]
+validAsysMaintenanceEventsApr <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 4,]
+validAsysMaintenanceEventsMay <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 5,]  
+validAsysMaintenanceEventsJun <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 6,]  
+validAsysMaintenanceEventsJul <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 7,]  
+validAsysMaintenanceEventsAug <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 8,]  
+validAsysMaintenanceEventsSep <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 9,]  
+validAsysMaintenanceEventsOct <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 10,]  
+```
+
+
+
+```{r}
+#FEBRUARY
+#load the property data - 2917 rows  (should be 2915)  (the import pulls in two totally blank rows at the end which are filtered out by the ASYS check routine).
+rawPropertyDataFeb <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-02-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value - 5 rows (3 genuine and 2 blanks from import)
+validAsysPropertyDataFeb <- filter(rawPropertyDataFeb, !is.na(as.numeric(as.character(rawPropertyDataFeb$ASYS))),)
+nrow(validAsysPropertyDataFeb)
+#valid row count is correct at 2912 - 5 rows excluded (3 genuine and 2 blanks from import)
+
+#MARCH
+#load the property data
+rawPropertyDataMar <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-03-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value
+validAsysPropertyDataMar <- filter(rawPropertyDataMar, !is.na(as.numeric(as.character(rawPropertyDataMar$ASYS))),)
+nrow(validAsysPropertyDataMar)
+#Row count correct at 2931 - 7 blank asys
+
+#APRIL
+#load the property data
+rawPropertyDataApr <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-04-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value
+validAsysPropertyDataApr <- filter(rawPropertyDataApr, !is.na(as.numeric(as.character(rawPropertyDataApr$ASYS))),)
+nrow(validAsysPropertyDataApr)
+#Row count correct at 2931 - 3 blank asys
+
+
+#MAY
+#load the property data
+rawPropertyDataMay <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-05-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value
+validAsysPropertyDataMay <- filter(rawPropertyDataMay, !is.na(as.numeric(as.character(rawPropertyDataMay$ASYS))),)
+nrow(validAsysPropertyDataMay)
+#Row count correct at 2933 - 2 blank asys
+
+#JUNE
+#load the property data
+rawPropertyDataJun <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-06-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value
+validAsysPropertyDataJun <- filter(rawPropertyDataJun, !is.na(as.numeric(as.character(rawPropertyDataJun$ASYS))),)
+nrow(validAsysPropertyDataJun)
+#Row count correct at 2933 - 9 blank asys
+
+#JUL
+#load the property data
+rawPropertyDataJul <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-07-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value
+validAsysPropertyDataJul <- filter(rawPropertyDataJul, !is.na(as.numeric(as.character(rawPropertyDataJul$ASYS))),)
+nrow(validAsysPropertyDataJul)
+#Row count correct at 2934 - 18 blank asys
+
+#AUG
+#load the property data
+rawPropertyDataAug <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-08-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value
+validAsysPropertyDataAug <- filter(rawPropertyDataAug, !is.na(as.numeric(as.character(rawPropertyDataAug$ASYS))),)
+nrow(validAsysPropertyDataAug)
+#Row count correct at 2942 - 8 blank asys and 1 marked 'DUPLICATE'
+
+#SEP
+#load the property data
+rawPropertyDataSep <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-09-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value
+validAsysPropertyDataSep <- filter(rawPropertyDataSep, !is.na(as.numeric(as.character(rawPropertyDataSep$ASYS))),)
+nrow(validAsysPropertyDataSep)
+#Row count correct at 2935 - 18 blank asys 
+
+#OCT
+#load the property data
+rawPropertyDataOct <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-10-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value
+validAsysPropertyDataOct <- filter(rawPropertyDataOct, !is.na(as.numeric(as.character(rawPropertyDataOct$ASYS))),)
+nrow(validAsysPropertyDataOct)
+#Row count correct at 2953 - 5 blank asys 
+```
+
+
+```{r}
+#remove negative bedspaces 
+validAsysPropertyDataFeb$Negative.Bedspaces <- ifelse(validAsysPropertyDataFeb$Available.Bedspaces < 0, abs(validAsysPropertyDataFeb$Available.Bedspaces), 0)
+validAsysPropertyDataFeb$Available.Bedspaces <- ifelse(validAsysPropertyDataFeb$Available.Bedspaces < 0, 0, validAsysPropertyDataFeb$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataFeb$Negative.Bedrooms <- ifelse(validAsysPropertyDataFeb$Available.Bedrooms < 0, abs(validAsysPropertyDataFeb$Available.Bedrooms), 0)
+validAsysPropertyDataFeb$Available.Bedrooms <- ifelse(validAsysPropertyDataFeb$Available.Bedrooms < 0, 0, validAsysPropertyDataFeb$Available.Bedrooms)
+
+
+
+#remove negative bedspaces 
+validAsysPropertyDataMar$Negative.Bedspaces <- ifelse(validAsysPropertyDataMar$Available.Bedspaces < 0, abs(validAsysPropertyDataMar$Available.Bedspaces), 0)
+validAsysPropertyDataMar$Available.Bedspaces <- ifelse(validAsysPropertyDataMar$Available.Bedspaces < 0, 0, validAsysPropertyDataMar$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataMar$Negative.Bedrooms <- ifelse(validAsysPropertyDataMar$Available.Bedrooms < 0, abs(validAsysPropertyDataMar$Available.Bedrooms), 0)
+validAsysPropertyDataMar$Available.Bedrooms <- ifelse(validAsysPropertyDataMar$Available.Bedrooms < 0, 0, validAsysPropertyDataMar$Available.Bedrooms)
+
+
+#remove negative bedspaces 
+validAsysPropertyDataApr$Negative.Bedspaces <- ifelse(validAsysPropertyDataApr$Available.Bedspaces < 0, abs(validAsysPropertyDataApr$Available.Bedspaces), 0)
+validAsysPropertyDataApr$Available.Bedspaces <- ifelse(validAsysPropertyDataApr$Available.Bedspaces < 0, 0, validAsysPropertyDataApr$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataApr$Negative.Bedrooms <- ifelse(validAsysPropertyDataApr$Available.Bedrooms < 0, abs(validAsysPropertyDataApr$Available.Bedrooms), 0)
+validAsysPropertyDataApr$Available.Bedrooms <- ifelse(validAsysPropertyDataApr$Available.Bedrooms < 0, 0, validAsysPropertyDataApr$Available.Bedrooms)
+
+#remove negative bedspaces 
+validAsysPropertyDataMay$Negative.Bedspaces <- ifelse(validAsysPropertyDataMay$Available.Bedspaces < 0, abs(validAsysPropertyDataMay$Available.Bedspaces), 0)
+validAsysPropertyDataMay$Available.Bedspaces <- ifelse(validAsysPropertyDataMay$Available.Bedspaces < 0, 0, validAsysPropertyDataMay$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataMay$Negative.Bedrooms <- ifelse(validAsysPropertyDataMay$Available.Bedrooms < 0, abs(validAsysPropertyDataMay$Available.Bedrooms), 0)
+validAsysPropertyDataMay$Available.Bedrooms <- ifelse(validAsysPropertyDataMay$Available.Bedrooms < 0, 0, validAsysPropertyDataMay$Available.Bedrooms)
+
+
+#remove negative bedspaces 
+validAsysPropertyDataJun$Negative.Bedspaces <- ifelse(validAsysPropertyDataJun$Available.Bedspaces < 0, abs(validAsysPropertyDataJun$Available.Bedspaces), 0)
+validAsysPropertyDataJun$Available.Bedspaces <- ifelse(validAsysPropertyDataJun$Available.Bedspaces < 0, 0, validAsysPropertyDataJun$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataJun$Negative.Bedrooms <- ifelse(validAsysPropertyDataJun$Available.Bedrooms < 0, abs(validAsysPropertyDataJun$Available.Bedrooms), 0)
+validAsysPropertyDataJun$Available.Bedrooms <- ifelse(validAsysPropertyDataJun$Available.Bedrooms < 0, 0, validAsysPropertyDataJun$Available.Bedrooms)
+
+
+#remove negative bedspaces 
+validAsysPropertyDataJul$Negative.Bedspaces <- ifelse(validAsysPropertyDataJul$Available.Bedspaces < 0, abs(validAsysPropertyDataJul$Available.Bedspaces), 0)
+validAsysPropertyDataJul$Available.Bedspaces <- ifelse(validAsysPropertyDataJul$Available.Bedspaces < 0, 0, validAsysPropertyDataJul$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataJul$Negative.Bedrooms <- ifelse(validAsysPropertyDataJul$Available.Bedrooms < 0, abs(validAsysPropertyDataJul$Available.Bedrooms), 0)
+validAsysPropertyDataJul$Available.Bedrooms <- ifelse(validAsysPropertyDataJul$Available.Bedrooms < 0, 0, validAsysPropertyDataJul$Available.Bedrooms)
+
+
+#remove negative bedspaces 
+validAsysPropertyDataAug$Negative.Bedspaces <- ifelse(validAsysPropertyDataAug$Available.Bedspaces < 0, abs(validAsysPropertyDataAug$Available.Bedspaces), 0)
+validAsysPropertyDataAug$Available.Bedspaces <- ifelse(validAsysPropertyDataAug$Available.Bedspaces < 0, 0, validAsysPropertyDataAug$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataAug$Negative.Bedrooms <- ifelse(validAsysPropertyDataAug$Available.Bedrooms < 0, abs(validAsysPropertyDataAug$Available.Bedrooms), 0)
+validAsysPropertyDataAug$Available.Bedrooms <- ifelse(validAsysPropertyDataAug$Available.Bedrooms < 0, 0, validAsysPropertyDataAug$Available.Bedrooms)
+
+
+#remove negative bedspaces 
+validAsysPropertyDataSep$Negative.Bedspaces <- ifelse(validAsysPropertyDataSep$Available.Bedspaces < 0, abs(validAsysPropertyDataSep$Available.Bedspaces), 0)
+validAsysPropertyDataSep$Available.Bedspaces <- ifelse(validAsysPropertyDataSep$Available.Bedspaces < 0, 0, validAsysPropertyDataSep$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataSep$Negative.Bedrooms <- ifelse(validAsysPropertyDataSep$Available.Bedrooms < 0, abs(validAsysPropertyDataSep$Available.Bedrooms), 0)
+validAsysPropertyDataSep$Available.Bedrooms <- ifelse(validAsysPropertyDataSep$Available.Bedrooms < 0, 0, validAsysPropertyDataSep$Available.Bedrooms)
+
+
+#remove negative bedspaces 
+validAsysPropertyDataOct$Negative.Bedspaces <- ifelse(validAsysPropertyDataOct$Available.Bedspaces < 0, abs(validAsysPropertyDataOct$Available.Bedspaces), 0)
+validAsysPropertyDataOct$Available.Bedspaces <- ifelse(validAsysPropertyDataOct$Available.Bedspaces < 0, 0, validAsysPropertyDataOct$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataOct$Negative.Bedrooms <- ifelse(validAsysPropertyDataOct$Available.Bedrooms < 0, abs(validAsysPropertyDataOct$Available.Bedrooms), 0)
+validAsysPropertyDataOct$Available.Bedrooms <- ifelse(validAsysPropertyDataOct$Available.Bedrooms < 0, 0, validAsysPropertyDataOct$Available.Bedrooms)
+```
+
+
+
+*Pair faults with property data*
+```{r}
+#property 2912 rows
+#events Feb 11304
+propertyEventsFeb <- join(y = validAsysPropertyDataFeb, x = validAsysMaintenanceEventsFeb, by = c("ASYS"), type = "left", match = "all")
+
+#11304 rows in the joined dataset - exactly the number of rows in the events dataset
+propertyEventsMar <- join(y = validAsysPropertyDataMar, x = validAsysMaintenanceEventsMar, by = c("ASYS"), type = "left", match = "all")
+
+propertyEventsApr <- join(y = validAsysPropertyDataApr, x = validAsysMaintenanceEventsApr, by = c("ASYS"), type = "left", match = "all")
+
+propertyEventsMay <- join(y = validAsysPropertyDataMay, x = validAsysMaintenanceEventsMay, by = c("ASYS"), type = "left", match = "all")
+
+propertyEventsJun <- join(y = validAsysPropertyDataJun, x = validAsysMaintenanceEventsJun, by = c("ASYS"), type = "left", match = "all")
+
+propertyEventsJul <- join(y = validAsysPropertyDataJul, x = validAsysMaintenanceEventsJul, by = c("ASYS"), type = "left", match = "all")
+
+propertyEventsAug <- join(y = validAsysPropertyDataAug, x = validAsysMaintenanceEventsAug, by = c("ASYS"), type = "left", match = "all")
+
+propertyEventsSep <- join(y = validAsysPropertyDataSep, x = validAsysMaintenanceEventsSep, by = c("ASYS"), type = "left", match = "all")
+
+propertyEventsOct <- join(y = validAsysPropertyDataOct, x = validAsysMaintenanceEventsOct, by = c("ASYS"), type = "left", match = "all")
+
+
+propertyEvents <- rbind(propertyEventsFeb, propertyEventsMar, propertyEventsApr, propertyEventsMay, propertyEventsJun, propertyEventsJul, propertyEventsAug, propertyEventsSep, propertyEventsOct)
+
+
+#looks like there are events that dont relate to a property and properties that have had no events (but the later wont be shown in the data set)
+
+#find events with no 'Property.Category' which indicates the property details for the event were not found
+eventsWithNoProperty <- filter(propertyEvents, is.na(propertyEvents$Property.Category))
+
+#count number of events by ASYS number  (432 events in total across 25 properties) - we'll exclude them
+eventsWithNoPropertyCount <- plyr::count(eventsWithNoProperty, "ASYS")
+
+#exclude merged event row where there are no property details - should be 11304 - 432 = 10872
+completeRows <- subset(propertyEvents, !is.na(propertyEvents$Property.Category),)
+
+#There are some blank values in fields that need cleaning up
+completeRows$Town[completeRows$Town == ""] <- "Unknown Town"
+completeRows$Event.Accommodation.Type[completeRows$Event.Accommodation.Type == ""] <- "Unknown Accommodation Type"
+completeRows$Occupancy.Type[completeRows$Occupancy.Type == ""] <- "Unknown Occupancy Type"
+```
+
+
+*Create ML Data Set - Filter out attributes that wont add anything to our model*
+```{r}
+#Group by ASYS and month so we have events per property per month.
+
+#should give 19185 rows - but gives 19342 - some property details have changed 'in month'.
+#I think these are still valid observations that should be kept.
+
+mlSet = count(completeRows, c(
+'ASYS',
+'Property.Status.at.Capture',
+'No.of.Occupants',
+'Event.Accommodation.Type',
+'Property.Category',
+'Town',
+'Property.Type',
+'Accommodation.Type',
+'Occupancy.Type',
+'Property.Status',
+'Bed.rooms',
+'Bedspaces',
+'Active.Service.Users',
+'Active.Service.Users.Plus',
+'Available.Bedrooms',
+'Available.Bedspaces',
+'Occupancy',
+'Rent',
+'Lease.Type',
+'No.Area.Bedrooms',
+'Total.Calculated.Bedspaces',
+'No.Area.Lounges',
+'No.Area.Dining.Rooms',
+'No.Area.Kitchens',
+'No.Area.Kitchen.Diners',
+'No.Area.Utilities',
+'No.Area.W.C.s',
+'No.Area.Bathrooms',
+'No.Area.Ensuites',
+'No.Floors',
+'Negative.Bedspaces',
+'Negative.Bedrooms',
+'Fault.Identified.Month.Number'
+))
+
+#remove the property identifier and the month - we dont need them and they may influence learning
+mlSet <- mlSet[ , names(mlSet) != "ASYS"]
+mlSet <- mlSet[ , names(mlSet) != "Fault.Identified.Month.Number"]
+
+#Removed 'Landlord.Company.Name' from the dataset because it generates lots of columns and doesn't seem to be very important for predicting faults.
+#!Removed Ward - because its troublesome - might bring it back in later
+
+mlSet
+```
+
+
+Starting Machine Learning
+-------------------------
+We want to use linear regression and predict the number of issues based on location, occupancy, occupant type and property type with 85% accuracy.
+
+```{r}
+#basic stats
+summary(mlSet)
+
+#complete roles - no output here means all the rows have values in every column
+mlSet <- mlSet[complete.cases(mlSet),]
+mlSet[!complete.cases(mlSet),]
+```
+
+The variable 'mlSet' not contains all the data you need to start buidling models.
+
+
+*TRIM THE DATASET - REMOVE IF YOU DONT WANT THIS!*
+===
+```{r}
+mlSet = filter(mlSet, freq < 20)
+```
+
+
+*Create Test and Train set*
+```{r}
+#force the random number seed so this is repeatable - would remove this in production 
+set.seed(3456)
+
+#shuffle the dataset  
+n <- nrow(mlSet)
+shuffled_mlSet <- mlSet[sample(n), ]
+
+#split it into train and test set (70/30) using caret
+trainIndex = createDataPartition(shuffled_mlSet[,c('freq')], 
+                       p=0.7, list=FALSE,times=1)
+
+train = shuffled_mlSet[trainIndex,]
+test = shuffled_mlSet[-trainIndex,]
+```
+
+
+
+H2O Learning
+===
+```{r}
+library(h2o)
+
+# tell h2o its free to use all processors, otherwise it will default to 2.
+h2o.init(nthreads = -1)
+
+# setup a clean slate, just in case there is anything left over from previous uses.
+h2o.removeAll()
+
+```
+
+```{r}
+train.h2o <- as.h2o(train)
+test.h2o <- as.h2o(test)
+
+#uploading to H2O introduces a spurious row of all NA's - remove them with a dedicted h2o function
+train.h2o <- na.omit(train.h2o)
+test.h2o <- na.omit(test.h2o)
+
+
+#helper function to convert a H2O frame back to a R Dataframe
+downloadedTestDF <- as.data.frame(test.h2o)
+downloadedTrainDF <- as.data.frame(train.h2o)
+
+#check column index numbers 
+colnames(train.h2o)
+```
+
+```{r}
+#dependent variable (freq)
+y.dep <- 32 
+
+#independent variables (dropping dependent column (freq))
+#x.indep <- c(1:1016) - this works for Feb only
+x.indep <- c(1:31) 
+```
+
+
+
+1.  Deep Learning (Neural Net)
+===
+```{r}
+system.time(
+             dlearning.model <- h2o.deeplearning(
+             y = y.dep,
+             x = x.indep,
+             training_frame = train.h2o,
+             validation_frame=test.h2o,
+             epochs = 300,
+             variable_importances=T,
+             hidden = c(128,128,128),
+             #activation = "Rectifier",
+             seed = 1122
+             )
+)
+summary(dlearning.model)
+```
+
+```{r}
+h2o.performance(dlearning.model)
+
+#check variable importance
+h2o.varimp(dlearning.model)
+```
+
+Checking predictions
+```{r}
+#helper function to convert a H2O frame back to a R Dataframe
+#(for some reason, H2O adds a row with all NA's when the frame is uploaded)
+downloadedTestDF <- as.data.frame(test.h2o)
+
+#make predictions
+dl_predict.reg <- as.data.frame(h2o.predict(dlearning.model, test.h2o))
+
+dl_sub_reg <- data.frame(testFreq = test$freq, roundPredictFreq = round(dl_predict.reg$predict, 0), predictedFreq =  dl_predict.reg$predict)
+
+rmse(dl_sub_reg$testFreq, dl_sub_reg$predictedFreq)
+rmse(dl_sub_reg$testFreq, dl_sub_reg$roundPredictFreq)
+cat("Percentage Wrong ", length(which(dl_sub_reg$testFreq != dl_sub_reg$roundPredictFreq)) / nrow(dl_sub_reg)*100, "%")
+
+cat("Actual Faults ", sum(dl_sub_reg$testFreq))
+cat("Predicted Faults ", sum(dl_sub_reg$roundPredictFreq))
+
+plot(dl_sub_reg$testFreq,dl_sub_reg$roundPredictFreq,col='blue',main='Real vs Predicted',
+     pch=1,cex=0.9,type = "p",xlab = "Actual",ylab = "Predicted")
+abline(0,1,col="black")
+```
+Basically, the plot shows that the model kinda sucks!  Looks like it underpredicting in most cases.  The chart should be a square ideally but we are stretched to the right.
+
+
+
+Early Stopping
+===
+```{r}
+m3<-h2o.deeplearning(
+                        y = y.dep,
+                        x = x.indep,
+                        training_frame = train.h2o,
+                        validation_frame=test.h2o,
+                        seed = 1234,
+                        nfolds = 3,
+                        stopping_rounds = 7,
+                        epochs = 400,
+                        overwrite_with_best_model = TRUE,
+                        activation = "Tanh",
+                        input_dropout_ratio = 0.1,
+                        hidden = c(10,10),
+                        l1 = 6e-4,
+                        loss = "Automatic",
+                        distribution = "AUTO",
+                        stopping_metric = "MSE")
+summary(m2)
+h2o.performance(m2)
+plot(m2)
+```
+
+Checking predictions
+```{r}
+#helper function to convert a H2O frame back to a R Dataframe
+#(for some reason, H2O adds a row with all NA's when the frame is uploaded)
+downloadedTestDF <- as.data.frame(test.h2o)
+
+#make predictions
+dl_predict.reg <- as.data.frame(h2o.predict(m3, test.h2o))
+
+dl_sub_reg <- data.frame(testFreq = test$freq, roundPredictFreq = round(dl_predict.reg$predict, 0), predictedFreq =  dl_predict.reg$predict)
+
+rmse(dl_sub_reg$testFreq, dl_sub_reg$predictedFreq)
+rmse(dl_sub_reg$testFreq, dl_sub_reg$roundPredictFreq)
+cat("Percentage Wrong ", length(which(dl_sub_reg$testFreq != dl_sub_reg$roundPredictFreq)) / nrow(dl_sub_reg)*100, "%")
+
+cat("Actual Faults ", sum(dl_sub_reg$testFreq))
+cat("Predicted Faults ", sum(dl_sub_reg$roundPredictFreq))
+
+plot(dl_sub_reg$testFreq,dl_sub_reg$roundPredictFreq,col='blue',main='Real vs Predicted',
+     pch=1,cex=0.9,type = "p",xlab = "Actual",ylab = "Predicted")
+abline(0,1,col="black")
+```
+
+
+
+
+
+
+
+
+
+
+Random HyperParameter Search
+===
+Using an automated random hyper parameter search to try and find good model settings.
+```{r}
+
+hyper_params <- list(
+                     activation = c("Rectifier", "Maxout", "Tanh", "RectifierWithDropout", "MaxoutWithDropout", "TanhWithDropout"), 
+                     hidden = list(c(5, 5, 5, 5, 5), c(10, 10, 10, 10), c(50, 50, 50), c(100, 100, 100)),
+                     epochs = c(50, 100, 200),
+                     l1 = c(0, 0.00001, 0.0001), 
+                     l2 = c(0, 0.00001, 0.0001),
+                     rate = c(0, 01, 0.005, 0.001),
+                     rate_annealing = c(1e-8, 1e-7, 1e-6),
+                     rho = c(0.9, 0.95, 0.99, 0.999),
+                     epsilon = c(1e-10, 1e-8, 1e-6, 1e-4),
+                     momentum_start = c(0, 0.5),
+                     momentum_stable = c(0.99, 0.5, 0),
+                     input_dropout_ratio = c(0, 0.1, 0.2),
+                     max_w2 = c(10, 100, 1000, 3.4028235e+38)
+                     )
+
+search_criteria <- list(strategy = "RandomDiscrete", 
+                        max_models = 100,
+                        max_runtime_secs = 900,
+                        stopping_tolerance = 0.001,
+                        stopping_rounds = 15,
+                        seed = 42)
+
+dl_grid <- h2o.grid(algorithm = "deeplearning", 
+                    x = x.indep,
+                    y = y.dep,
+                  
+                    grid_id = "dl_grid",
+                    training_frame = train.h2o,
+                    validation_frame = test.h2o,
+                    nfolds = 25,                           
+                    fold_assignment = "Stratified",
+                    hyper_params = hyper_params,
+                    search_criteria = search_criteria,
+                    seed = 42
+                    )
+
+
+
+                               
+grid <- h2o.getGrid("dl_grid",sort_by="RMSE",decreasing=FALSE)
+grid
+
+grid@summary_table[1,]
+best_model <- h2o.getModel(grid@model_ids[[1]]) ## model with lowest logloss
+best_model
+```
+
+
+```{r}
+summary(best_model)
+```
+
+Checking predictions
+```{r}
+#helper function to convert a H2O frame back to a R Dataframe
+#(for some reason, H2O adds a row with all NA's when the frame is uploaded)
+downloadedTestDF <- as.data.frame(test.h2o)
+
+#make predictions
+dl_predict.reg <- as.data.frame(h2o.predict(best_model, test.h2o))
+
+dl_sub_reg <- data.frame(testFreq = test$freq, roundPredictFreq = round(dl_predict.reg$predict, 0), predictedFreq =  dl_predict.reg$predict)
+
+rmse(dl_sub_reg$testFreq, dl_sub_reg$predictedFreq)
+rmse(dl_sub_reg$testFreq, dl_sub_reg$roundPredictFreq)
+cat("Percentage Wrong ", length(which(dl_sub_reg$testFreq != dl_sub_reg$roundPredictFreq)) / nrow(dl_sub_reg)*100, "%")
+
+cat("Actual Faults ", sum(dl_sub_reg$testFreq))
+cat("Predicted Faults ", sum(dl_sub_reg$roundPredictFreq))
+
+plot(dl_sub_reg$testFreq,dl_sub_reg$roundPredictFreq,col='blue',main='Real vs Predicted',
+     pch=1,cex=0.9,type = "p",xlab = "Actual",ylab = "Predicted")
+abline(0,1,col="black")
+```

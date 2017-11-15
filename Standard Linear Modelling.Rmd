@@ -1,0 +1,1038 @@
+---
+title: "Serco Maintenance Event Modelling - Standard Linear Modelling"
+output: html_notebook
+---
+
+Summary
+-------
+This uses the full dataset.
+
+We're doing regression because we want to predict a number.  (the predicted number of maintenance incidents for the proerty in the month).
+
+
+*Import Libraries*
+```{r}
+library("tidyverse")
+library("dplyr")
+library("plyr")
+library(lubridate)
+library(stringr)
+library(caret, quietly = TRUE)
+library(hydroGOF)
+library(gbm)
+library(xgboost)
+library(glmnet)
+library("FactoMineR")
+library("factoextra")
+library(corrplot)
+
+library(caret)
+library(corrplot)
+library(xgboost)
+library(stats)
+library(knitr)
+library(ggplot2)
+library(Matrix)
+library(plotly)
+library(htmlwidgets)
+library(readr)
+library(randomForest)
+library(data.table)
+library(h2o)
+library(dplyr)
+library(tidyr)
+library(Hmisc)
+library(psych)
+```
+
+Load maintenance events which includes data on the nature of the fault, the fix information and the costs.
+```{r}
+#load the fault fix data
+rawMaintenanceEvents <- read.csv("csv/Fault Fixed - Costings - Modified.csv", skip=0, stringsAsFactors = FALSE)
+nrow(rawMaintenanceEvents)
+
+#rename 'Address', 'Accommodation.Type' and 'Housing.Officer' fields because they are common to both datasets we will join
+names(rawMaintenanceEvents)[names(rawMaintenanceEvents)=="Address"] <- "Event.Address"
+names(rawMaintenanceEvents)[names(rawMaintenanceEvents)=="Accommodation.Type"] <- "Event.Accommodation.Type"
+names(rawMaintenanceEvents)[names(rawMaintenanceEvents)=="Housing.Officer"] <- "Event.Housing.Officer"
+
+#convert 'Identified.date' date strings to actual dates - We use the lubridate package to parse the datetimes and we use the very useful parse_date_time method because it allow us to specify different format patterns.  This is needed because some of the values in the 'identified date' column have seconds and some dont.  The first format is used for the parsing and if that fails, the second format is used.  Beware that if we just used the second format on a datetime with no seconds it wouldn't error but it would produce the wrong result (the year would be 2020.. which is totally wrong).
+#See (https://skgrange.github.io/date_handling.html) for more information.
+rawMaintenanceEvents <- mutate(rawMaintenanceEvents, Identified.date= parse_date_time(Identified.date, orders = c("dmy_HM", "dmy_HMS"), tz = "UTC"))
+nrow(rawMaintenanceEvents)
+
+#filter to only keep events identified in 2017
+#we exclude 2422 rows that have a blank Identified Date or an Identified date that is in 2016
+filteredMaintenanceEvents <- filter(rawMaintenanceEvents, Identified.date >= dmy_hms("01-01-2017 00:00:00"))
+nrow(filteredMaintenanceEvents)
+```
+
+```{r}
+#127 rows have invalid ASYS value,including blanks -29 without blanks with values of (DON'T USE, DUPLICATE, DUPLICATE ARCHIVED, TBC)
+invalidAsysRows <- subset(filteredMaintenanceEvents, is.na(as.numeric(as.character(filteredMaintenanceEvents$ASYS))),)
+invalidAsysRows
+nrow(invalidAsysRows)
+
+#Do the conversion of ASYS numbers to actual numbers - anything that doesn't convert changes to NA.
+convertedMaintenanceEvents <- mutate(filteredMaintenanceEvents, ASYS= as.numeric(as.character(filteredMaintenanceEvents$ASYS)))
+nrow(convertedMaintenanceEvents)
+
+#filter out 127 rows with NA ASYS number
+validAsysMaintenanceEvents <- subset(convertedMaintenanceEvents, !is.na(convertedMaintenanceEvents$ASYS),)
+nrow(validAsysMaintenanceEvents)
+```
+
+
+
+```{r}
+#There is no property data for January so we'll won't use it
+#validAsysMaintenanceEventsJan <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 1,]
+```
+
+```{r}
+validAsysMaintenanceEventsFeb <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 2,]
+validAsysMaintenanceEventsMar <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 3,]
+validAsysMaintenanceEventsApr <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 4,]
+validAsysMaintenanceEventsMay <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 5,]  
+validAsysMaintenanceEventsJun <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 6,]  
+validAsysMaintenanceEventsJul <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 7,]  
+validAsysMaintenanceEventsAug <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 8,]  
+validAsysMaintenanceEventsSep <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 9,]  
+```
+
+```{r}
+#No maintenance events in October - we will not use
+validAsysMaintenanceEventsOct <- validAsysMaintenanceEvents[validAsysMaintenanceEvents$Fault.Identified.Month.Number == 10,]  
+```
+
+
+
+```{r}
+#FEBRUARY
+#load the property data - 2917 rows  (should be 2915)  (the import pulls in two totally blank rows at the end which are filtered out by the ASYS check routine).
+rawPropertyDataFeb <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-02-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value - 5 rows (3 genuine and 2 blanks from import)
+validAsysPropertyDataFeb <- filter(rawPropertyDataFeb, !is.na(as.numeric(as.character(rawPropertyDataFeb$ASYS))),)
+nrow(validAsysPropertyDataFeb)
+#valid row count is correct at 2912 - 5 rows excluded (3 genuine and 2 blanks from import)
+
+#MARCH
+#load the property data
+rawPropertyDataMar <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-03-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value
+validAsysPropertyDataMar <- filter(rawPropertyDataMar, !is.na(as.numeric(as.character(rawPropertyDataMar$ASYS))),)
+nrow(validAsysPropertyDataMar)
+#Row count correct at 2931 - 7 blank asys
+
+#APRIL
+#load the property data
+rawPropertyDataApr <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-04-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value
+validAsysPropertyDataApr <- filter(rawPropertyDataApr, !is.na(as.numeric(as.character(rawPropertyDataApr$ASYS))),)
+nrow(validAsysPropertyDataApr)
+#Row count correct at 2931 - 3 blank asys
+
+#MAY
+#load the property data
+rawPropertyDataMay <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-05-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value
+validAsysPropertyDataMay <- filter(rawPropertyDataMay, !is.na(as.numeric(as.character(rawPropertyDataMay$ASYS))),)
+nrow(validAsysPropertyDataMay)
+#Row count correct at 2933 - 2 blank asys
+
+#JUNE
+#load the property data
+rawPropertyDataJun <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-06-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value
+validAsysPropertyDataJun <- filter(rawPropertyDataJun, !is.na(as.numeric(as.character(rawPropertyDataJun$ASYS))),)
+nrow(validAsysPropertyDataJun)
+#Row count correct at 2933 - 9 blank asys
+
+#JUL
+#load the property data
+rawPropertyDataJul <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-07-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value
+validAsysPropertyDataJul <- filter(rawPropertyDataJul, !is.na(as.numeric(as.character(rawPropertyDataJul$ASYS))),)
+nrow(validAsysPropertyDataJul)
+#Row count correct at 2934 - 18 blank asys
+
+#AUG
+#load the property data
+rawPropertyDataAug <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-08-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value
+validAsysPropertyDataAug <- filter(rawPropertyDataAug, !is.na(as.numeric(as.character(rawPropertyDataAug$ASYS))),)
+nrow(validAsysPropertyDataAug)
+#Row count correct at 2942 - 8 blank asys and 1 marked 'DUPLICATE'
+
+#SEP
+#load the property data
+rawPropertyDataSep <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-09-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value
+validAsysPropertyDataSep <- filter(rawPropertyDataSep, !is.na(as.numeric(as.character(rawPropertyDataSep$ASYS))),)
+nrow(validAsysPropertyDataSep)
+#Row count correct at 2935 - 18 blank asys 
+
+#OCT
+#load the property data
+rawPropertyDataOct <- read.csv("csv/Available_Bedrooms_And_Bedspaces_NW_2017-10-01.csv", skip=3, stringsAsFactors = FALSE)
+
+#filter out rows that do not have a valid ASYS value
+validAsysPropertyDataOct <- filter(rawPropertyDataOct, !is.na(as.numeric(as.character(rawPropertyDataOct$ASYS))),)
+nrow(validAsysPropertyDataOct)
+#Row count correct at 2953 - 5 blank asys 
+```
+
+
+```{r}
+#remove negative bedspaces 
+validAsysPropertyDataFeb$Negative.Bedspaces <- ifelse(validAsysPropertyDataFeb$Available.Bedspaces < 0, abs(validAsysPropertyDataFeb$Available.Bedspaces), 0)
+validAsysPropertyDataFeb$Available.Bedspaces <- ifelse(validAsysPropertyDataFeb$Available.Bedspaces < 0, 0, validAsysPropertyDataFeb$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataFeb$Negative.Bedrooms <- ifelse(validAsysPropertyDataFeb$Available.Bedrooms < 0, abs(validAsysPropertyDataFeb$Available.Bedrooms), 0)
+validAsysPropertyDataFeb$Available.Bedrooms <- ifelse(validAsysPropertyDataFeb$Available.Bedrooms < 0, 0, validAsysPropertyDataFeb$Available.Bedrooms)
+
+
+
+#remove negative bedspaces 
+validAsysPropertyDataMar$Negative.Bedspaces <- ifelse(validAsysPropertyDataMar$Available.Bedspaces < 0, abs(validAsysPropertyDataMar$Available.Bedspaces), 0)
+validAsysPropertyDataMar$Available.Bedspaces <- ifelse(validAsysPropertyDataMar$Available.Bedspaces < 0, 0, validAsysPropertyDataMar$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataMar$Negative.Bedrooms <- ifelse(validAsysPropertyDataMar$Available.Bedrooms < 0, abs(validAsysPropertyDataMar$Available.Bedrooms), 0)
+validAsysPropertyDataMar$Available.Bedrooms <- ifelse(validAsysPropertyDataMar$Available.Bedrooms < 0, 0, validAsysPropertyDataMar$Available.Bedrooms)
+
+
+#remove negative bedspaces 
+validAsysPropertyDataApr$Negative.Bedspaces <- ifelse(validAsysPropertyDataApr$Available.Bedspaces < 0, abs(validAsysPropertyDataApr$Available.Bedspaces), 0)
+validAsysPropertyDataApr$Available.Bedspaces <- ifelse(validAsysPropertyDataApr$Available.Bedspaces < 0, 0, validAsysPropertyDataApr$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataApr$Negative.Bedrooms <- ifelse(validAsysPropertyDataApr$Available.Bedrooms < 0, abs(validAsysPropertyDataApr$Available.Bedrooms), 0)
+validAsysPropertyDataApr$Available.Bedrooms <- ifelse(validAsysPropertyDataApr$Available.Bedrooms < 0, 0, validAsysPropertyDataApr$Available.Bedrooms)
+
+#remove negative bedspaces 
+validAsysPropertyDataMay$Negative.Bedspaces <- ifelse(validAsysPropertyDataMay$Available.Bedspaces < 0, abs(validAsysPropertyDataMay$Available.Bedspaces), 0)
+validAsysPropertyDataMay$Available.Bedspaces <- ifelse(validAsysPropertyDataMay$Available.Bedspaces < 0, 0, validAsysPropertyDataMay$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataMay$Negative.Bedrooms <- ifelse(validAsysPropertyDataMay$Available.Bedrooms < 0, abs(validAsysPropertyDataMay$Available.Bedrooms), 0)
+validAsysPropertyDataMay$Available.Bedrooms <- ifelse(validAsysPropertyDataMay$Available.Bedrooms < 0, 0, validAsysPropertyDataMay$Available.Bedrooms)
+
+
+#remove negative bedspaces 
+validAsysPropertyDataJun$Negative.Bedspaces <- ifelse(validAsysPropertyDataJun$Available.Bedspaces < 0, abs(validAsysPropertyDataJun$Available.Bedspaces), 0)
+validAsysPropertyDataJun$Available.Bedspaces <- ifelse(validAsysPropertyDataJun$Available.Bedspaces < 0, 0, validAsysPropertyDataJun$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataJun$Negative.Bedrooms <- ifelse(validAsysPropertyDataJun$Available.Bedrooms < 0, abs(validAsysPropertyDataJun$Available.Bedrooms), 0)
+validAsysPropertyDataJun$Available.Bedrooms <- ifelse(validAsysPropertyDataJun$Available.Bedrooms < 0, 0, validAsysPropertyDataJun$Available.Bedrooms)
+
+
+#remove negative bedspaces 
+validAsysPropertyDataJul$Negative.Bedspaces <- ifelse(validAsysPropertyDataJul$Available.Bedspaces < 0, abs(validAsysPropertyDataJul$Available.Bedspaces), 0)
+validAsysPropertyDataJul$Available.Bedspaces <- ifelse(validAsysPropertyDataJul$Available.Bedspaces < 0, 0, validAsysPropertyDataJul$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataJul$Negative.Bedrooms <- ifelse(validAsysPropertyDataJul$Available.Bedrooms < 0, abs(validAsysPropertyDataJul$Available.Bedrooms), 0)
+validAsysPropertyDataJul$Available.Bedrooms <- ifelse(validAsysPropertyDataJul$Available.Bedrooms < 0, 0, validAsysPropertyDataJul$Available.Bedrooms)
+
+
+#remove negative bedspaces 
+validAsysPropertyDataAug$Negative.Bedspaces <- ifelse(validAsysPropertyDataAug$Available.Bedspaces < 0, abs(validAsysPropertyDataAug$Available.Bedspaces), 0)
+validAsysPropertyDataAug$Available.Bedspaces <- ifelse(validAsysPropertyDataAug$Available.Bedspaces < 0, 0, validAsysPropertyDataAug$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataAug$Negative.Bedrooms <- ifelse(validAsysPropertyDataAug$Available.Bedrooms < 0, abs(validAsysPropertyDataAug$Available.Bedrooms), 0)
+validAsysPropertyDataAug$Available.Bedrooms <- ifelse(validAsysPropertyDataAug$Available.Bedrooms < 0, 0, validAsysPropertyDataAug$Available.Bedrooms)
+
+
+#remove negative bedspaces 
+validAsysPropertyDataSep$Negative.Bedspaces <- ifelse(validAsysPropertyDataSep$Available.Bedspaces < 0, abs(validAsysPropertyDataSep$Available.Bedspaces), 0)
+validAsysPropertyDataSep$Available.Bedspaces <- ifelse(validAsysPropertyDataSep$Available.Bedspaces < 0, 0, validAsysPropertyDataSep$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataSep$Negative.Bedrooms <- ifelse(validAsysPropertyDataSep$Available.Bedrooms < 0, abs(validAsysPropertyDataSep$Available.Bedrooms), 0)
+validAsysPropertyDataSep$Available.Bedrooms <- ifelse(validAsysPropertyDataSep$Available.Bedrooms < 0, 0, validAsysPropertyDataSep$Available.Bedrooms)
+
+
+#remove negative bedspaces 
+validAsysPropertyDataOct$Negative.Bedspaces <- ifelse(validAsysPropertyDataOct$Available.Bedspaces < 0, abs(validAsysPropertyDataOct$Available.Bedspaces), 0)
+validAsysPropertyDataOct$Available.Bedspaces <- ifelse(validAsysPropertyDataOct$Available.Bedspaces < 0, 0, validAsysPropertyDataOct$Available.Bedspaces)
+
+#remove negative bedrooms
+validAsysPropertyDataOct$Negative.Bedrooms <- ifelse(validAsysPropertyDataOct$Available.Bedrooms < 0, abs(validAsysPropertyDataOct$Available.Bedrooms), 0)
+validAsysPropertyDataOct$Available.Bedrooms <- ifelse(validAsysPropertyDataOct$Available.Bedrooms < 0, 0, validAsysPropertyDataOct$Available.Bedrooms)
+```
+
+
+
+*Pair faults with property data*
+```{r}
+#property 2912 rows
+#events Feb 11304
+propertyEventsFeb <- join(x = validAsysPropertyDataFeb, y = validAsysMaintenanceEventsFeb, by = c("ASYS"), type = "left", match = "all")
+#assign a month number to properties that have no fault so that they are month aligned
+propertyEventsFeb$Fault.Identified.Month.Number[is.na(propertyEventsFeb$Fault.Identified.Month.Number)] <- 2
+#This tells us how many unique properties there are in the dataset - should be the same as the number of properties in the 
+#monthly property data.  Rows with NA in the fault reference are properties that have no faults
+tmpFeb <- plyr::count(propertyEventsFeb, "ASYS")
+#11304 rows with a fault reference - rest should be NA
+```
+
+
+```{r}
+propertyEventsMar <- join(x = validAsysPropertyDataMar, y = validAsysMaintenanceEventsMar, by = c("ASYS"), type = "left", match = "all")
+#assign a month number to properties that have no fault so that they are month aligned
+propertyEventsMar$Fault.Identified.Month.Number[is.na(propertyEventsMar$Fault.Identified.Month.Number)] <- 3
+#This tells us how many unique properties there are in the dataset - should be the same as the number of properties in the 
+#monthly property data.  Rows with NA in the fault reference are properties that have no faults
+tmpMar <- plyr::count(propertyEventsMar, "ASYS")
+
+propertyEventsApr <- join(x = validAsysPropertyDataApr, y = validAsysMaintenanceEventsApr, by = c("ASYS"), type = "left", match = "all")
+#assign a month number to properties that have no fault so that they are month aligned
+propertyEventsApr$Fault.Identified.Month.Number[is.na(propertyEventsApr$Fault.Identified.Month.Number)] <- 4
+#This tells us how many unique properties there are in the dataset - should be the same as the number of properties in the 
+#monthly property data.  Rows with NA in the fault reference are properties that have no faults
+tmpApr <- plyr::count(propertyEventsApr, "ASYS")
+
+
+propertyEventsMay <- join(x = validAsysPropertyDataMay, y = validAsysMaintenanceEventsMay, by = c("ASYS"), type = "left", match = "all")
+#assign a month number to properties that have no fault so that they are month aligned
+propertyEventsMay$Fault.Identified.Month.Number[is.na(propertyEventsMay$Fault.Identified.Month.Number)] <- 5
+#This tells us how many unique properties there are in the dataset - should be the same as the number of properties in the 
+#monthly property data.  Rows with NA in the fault reference are properties that have no faults
+tmpMay <- plyr::count(propertyEventsMay, "ASYS")
+
+propertyEventsJun <- join(x = validAsysPropertyDataJun, y = validAsysMaintenanceEventsJun, by = c("ASYS"), type = "left", match = "all")
+#assign a month number to properties that have no fault so that they are month aligned
+propertyEventsJun$Fault.Identified.Month.Number[is.na(propertyEventsJun$Fault.Identified.Month.Number)] <- 6
+#This tells us how many unique properties there are in the dataset - should be the same as the number of properties in the 
+#monthly property data.  Rows with NA in the fault reference are properties that have no faults
+tmpJun <- plyr::count(propertyEventsJun, "ASYS")
+
+propertyEventsJul <- join(x = validAsysPropertyDataJul, y = validAsysMaintenanceEventsJul, by = c("ASYS"), type = "left", match = "all")
+#assign a month number to properties that have no fault so that they are month aligned
+propertyEventsJul$Fault.Identified.Month.Number[is.na(propertyEventsJul$Fault.Identified.Month.Number)] <- 7
+#This tells us how many unique properties there are in the dataset - should be the same as the number of properties in the 
+#monthly property data.  Rows with NA in the fault reference are properties that have no faults
+tmpJul <- plyr::count(propertyEventsJul, "ASYS")
+
+propertyEventsAug <- join(x = validAsysPropertyDataAug, y = validAsysMaintenanceEventsAug, by = c("ASYS"), type = "left", match = "all")
+#assign a month number to properties that have no fault so that they are month aligned
+propertyEventsAug$Fault.Identified.Month.Number[is.na(propertyEventsAug$Fault.Identified.Month.Number)] <- 8
+#This tells us how many unique properties there are in the dataset - should be the same as the number of properties in the 
+#monthly property data.  Rows with NA in the fault reference are properties that have no faults
+tmpAug <- plyr::count(propertyEventsAug, "ASYS")
+
+propertyEventsSep <- join(x = validAsysPropertyDataSep, y = validAsysMaintenanceEventsSep, by = c("ASYS"), type = "left", match = "all")
+#assign a month number to properties that have no fault so that they are month aligned
+propertyEventsSep$Fault.Identified.Month.Number[is.na(propertyEventsSep$Fault.Identified.Month.Number)] <- 9
+#This tells us how many unique properties there are in the dataset - should be the same as the number of properties in the 
+#monthly property data.  Rows with NA in the fault reference are properties that have no faults
+tmpSep <- plyr::count(propertyEventsSep, "ASYS")
+
+propertyEventsOct <- join(x = validAsysPropertyDataOct, y = validAsysMaintenanceEventsOct, by = c("ASYS"), type = "left", match = "all")
+#assign a month number to properties that have no fault so that they are month aligned
+propertyEventsOct$Fault.Identified.Month.Number[is.na(propertyEventsOct$Fault.Identified.Month.Number)] <- 10
+#This tells us how many unique properties there are in the dataset - should be the same as the number of properties in the 
+#monthly property data.  Rows with NA in the fault reference are properties that have no faults
+tmpOct <- plyr::count(propertyEventsOct, "ASYS")
+
+propertyEvents <- rbind(propertyEventsFeb, propertyEventsMar, propertyEventsApr, propertyEventsMay, propertyEventsJun, propertyEventsJul, propertyEventsAug, propertyEventsSep, propertyEventsOct)
+
+#Note there are events in the faults dataset that dont correctly link to a property.. they are excluded by the join, which is fine.
+```
+
+```{r}
+#we've changed how we join faults to properties - there wont be any faults that dont relate to a valid property
+completeRows <- propertyEvents
+```
+
+```{r}
+#There are some blank values in fields that need cleaning up
+completeRows$Town[completeRows$Town == ""] <- "Unknown Town"
+completeRows$Event.Accommodation.Type[completeRows$Event.Accommodation.Type == ""] <- "Unknown Accommodation Type"
+completeRows$Event.Accommodation.Type[is.na(completeRows$Event.Accommodation.Type)] <- "Unknown Accommodation Type"
+completeRows$Occupancy.Type[completeRows$Occupancy.Type == ""] <- "Unknown Occupancy Type"
+completeRows$Property.Type[completeRows$Property.Type == ""] <- "Unknown Property Type"
+```
+
+
+```{r}
+#FILTER TO PROPERTY STATUS  ==ACTIVE AND STATUS AT CAPTURE == ACTIVE
+#Property.Status.at.Capture contains NA for properties that have zero faults in the month - make them active
+#94965
+completeRows$Property.Status.at.Capture[is.na(completeRows$Property.Status.at.Capture)] <- 'Active'
+
+#92995
+filteredCompleteRows <- filter(completeRows, Property.Status=='Active' & Property.Status.at.Capture=='Active')
+
+#define candidate features
+candidateFeatures <- c(
+'ASYS',
+'Fault.Reference',
+'Property.Status.at.Capture',
+'Town',
+'Ward',
+'Property.Type',
+'Accommodation.Type',
+'Occupancy.Type',
+'Bed.rooms',
+'Bedspaces',
+'Active.Service.Users',
+'Active.Service.Users.Plus',
+'Available.Bedrooms',
+'Available.Bedspaces',
+'Occupancy',
+'No.of.Occupants',
+'Landlord.Name',
+'Lease.Type',
+'Rent',
+'Total.Calculated.Bedspaces',
+'Event.Accommodation.Type',
+'Property.Category',
+'Property.Status',
+'Negative.Bedspaces',
+'Negative.Bedrooms',
+'Fault.Identified.Month.Number'
+)
+
+#ALL 'NO.XXX' COLUMNS IGNORED ON ANDY'S ADVICE
+#Extract candidate features
+faults <- filteredCompleteRows[,candidateFeatures]
+
+#summary(faults)
+
+#use the mean to remove NA values 
+faults$Total.Calculated.Bedspaces <- as.numeric(impute(faults$Total.Calculated.Bedspaces, mean))
+faults$No.of.Occupants <- as.numeric(impute(faults$No.of.Occupants, mean))
+
+summary(faults)
+```
+
+```{r}
+#HERE
+#Filter out the NA Fault References - these are our zero fault properties - need to keep all candidate features.
+#Count by our candidate features- these are our more than zero fault properties - need to keep all candidate features.
+
+#bind the two back together to give us a monthly fault count 
+
+#need to add the freq column and default to zero
+
+#7053
+zeroFaultProperties = subset(filter(faults, is.na(faults$Fault.Reference)),)
+zeroFaultProperties <- zeroFaultProperties[ , names(zeroFaultProperties) != "Fault.Reference"]
+zeroFaultProperties$freq <- 0
+
+#85942
+moreThanZeroFaultProperties = subset(filter(faults, !is.na(faults$Fault.Reference)),)
+#need to drop the Fault.Reference
+moreThanZeroFaultProperties <- moreThanZeroFaultProperties[ , names(moreThanZeroFaultProperties) != "Fault.Reference"]
+moreThanZeroFaultPropertiesSummary = count(moreThanZeroFaultProperties,)
+
+#25958
+propertyFaultSummary <- rbind(zeroFaultProperties, moreThanZeroFaultPropertiesSummary)
+```
+
+
+```{r}
+
+hist(propertyFaultSummary$freq)
+
+qplot(propertyFaultSummary$freq,
+      geom="histogram",
+      binwidth = 1,  
+      main = "Histogram for Maintenance Issues", 
+      xlab = "Number of Issues",  
+      ylab = "Number of Properties",  
+      fill=I("blue"), 
+      col=I("blue"), 
+      alpha=I(.2),
+      xlim=c(0,90))
+
+#We have a heavily right skewed distribution so we'll need to balance it before we can predict.
+#See: https://stats.stackexchange.com/questions/107610/what-is-the-reason-the-log-transformation-is-used-with-right-skewed-distribution
+```
+
+
+
+
+
+
+
+
+
+```{r}
+y = count(propertyFaultSummary, c('ASYS', 'Property.Type'))
+
+#Number of errors by property type
+propertyTypeBP1 <- ggplot(y, aes(x = Property.Type, y = freq, fill=Property.Type)) +
+        scale_x_discrete(name = "Property Type") +
+        scale_y_continuous(name = "Issues per Month", breaks = seq(0, 145, 5), limits=c(0, 145)) +
+        ggtitle("Boxplot of maintenance events by property type") +
+        geom_boxplot()
+propertyTypeBP1
+
+```
+
+
+Looks like there are in general more problems with detached properties.  Flats-Apartments are generally fine but there are a couple of problem properties.  There are a large number of high fault problem properties that are Terraced.
+
+```{r}
+y = count(propertyFaultSummary, c('ASYS', 'Event.Accommodation.Type'))
+
+#Number of errors by property type
+accomTypeBP1 <- ggplot(y, aes(x = Event.Accommodation.Type, y = freq, fill=Event.Accommodation.Type)) +
+        scale_x_discrete(name = "Accommodation Type") +
+        scale_y_continuous(name = "Issues per Month", breaks = seq(0, 145, 5), limits=c(0, 145)) +
+        ggtitle("Boxplot of maintenance events by accommodation type") +
+        geom_boxplot()
+accomTypeBP1
+
+```
+
+```{r}
+y = count(propertyFaultSummary, c('ASYS', 'Occupancy.Type'))
+
+#Number of errors by property type
+OccupancyTypeBP1 <- ggplot(y, aes(x = Occupancy.Type, y = freq, fill=Occupancy.Type)) +
+        scale_x_discrete(name = "Occupancy Type") +
+        scale_y_continuous(name = "Issues per Month", breaks = seq(0, 145, 5), limits=c(0, 145)) +
+        ggtitle("Boxplot of maintenance events by Occupancy Type") +
+        geom_boxplot()
+OccupancyTypeBP1
+
+```
+
+
+```{r}
+y = count(propertyFaultSummary, c('ASYS', 'Town'))
+
+#Number of errors by property type
+TownBP1 <- ggplot(y, aes(x = Town, y = freq, fill=Town)) +
+        scale_x_discrete(name = "Town") +
+        scale_y_continuous(name = "Issues per Month", breaks = seq(0, 145, 5), limits=c(0, 145)) +
+        ggtitle("Boxplot of maintenance events by town") +
+        geom_boxplot()
+TownBP1
+
+```
+
+```{r}
+y = count(propertyFaultSummary, c('ASYS', 'Occupancy'))
+
+#Number of errors by occupancy
+OccupancyBP1 <- ggplot(y, aes(x = factor(Occupancy), y = freq, fill=factor(Occupancy))) +
+        scale_x_discrete(name = "Occupancy") +
+        scale_y_continuous(name = "Issues per Month", breaks = seq(0, 145, 5), limits=c(0, 145)) +
+        ggtitle("Boxplot of maintenance events by occupancy") +
+        geom_boxplot()
+OccupancyBP1
+
+
+```
+
+
+*Create ML Data Set - Filter out attributes that wont add anything to our model*
+```{r}
+
+mlSet <- propertyFaultSummary
+
+selectedFeaturesData <- subset(propertyFaultSummary, select = c(Town, Property.Type, Accommodation.Type, Occupancy.Type, Bed.rooms, 
+                                                                Bedspaces, Active.Service.Users, Active.Service.Users.Plus, Available.Bedrooms, Available.Bedspaces, Occupancy, No.of.Occupants, Event.Accommodation.Type, Property.Category, Negative.Bedspaces, Negative.Bedrooms))
+
+#remove the property identifier and the month - we dont need them and they may colour learning
+#mlSet <- mlSet[ , names(mlSet) != "ASYS"]
+#mlSet <- mlSet[ , names(mlSet) != "Fault.Identified.Month.Number"]
+#mlSet <- mlSet[ , names(mlSet) != "Fault.Reference"]
+
+pairs.panels(selectedFeaturesData, col="red")
+
+#mlSet
+ggplot(mlSet, aes(x=No.of.Occupants, y=freq)) + geom_point()
+```
+
+
+
+
+
+
+Starting Machine Learning
+-------------------------
+We want to use linear regression and predict the number of issues based on location, occupancy, occupant type and property type with 85% accuracy.
+
+```{r}
+#basic stats
+summary(mlSet)
+
+#complete roles - no output here means all the rows have values in every column
+mlSet <- mlSet[complete.cases(mlSet),]
+mlSet[!complete.cases(mlSet),]
+```
+
+*TRIM THE DATASET - REMOVE IF YOU DONT WANT THIS!*
+===
+```{r}
+#mlSet = filter(mlSet, freq < 25)
+```
+
+*DESKEW
+```{r}
+#library(e1071)
+#column_classes = sapply(names(mlSet), function(x){class(mlSet[[x]])})
+#numeric_columns = names(column_classes[column_classes == "integer" | column_classes == "numeric"])
+#skew = sapply(numeric_columns, function(x){skewness(mlSet[[x]], na.rm = T)})
+#skew = skew[skew > 0.75]
+
+#Take the natural log of skewed variables
+#mlSet_log = mlSet
+#for(x in names(skew)) 
+#{
+#  if(x != "freq")
+#  {
+#    mlSet_log[[x]] = log(mlSet_log[[x]] + 1)
+#  }
+#}
+#summary(mlSet_log)
+#numeric_columns
+```
+
+*Convert our ML Set to a Sparse Matrix so all categorical values are One Hot Encoded*
+```{r}
+#to one hot encode all attributes that need it we use the 'sparse.model.matrix' function.  The params are as follows:
+#First parameter is the name of the column we are using as output, so it should be ignored.
+#Second parameter of '-1' removes an extra column which this command creates as the first column.
+#Third parameter specifies the name of the dataset that should be one hot encoded
+
+mlSet_matrix <- sparse.model.matrix(~ .-1, data = mlSet)
+#mlSet_matrix <- sparse.model.matrix(~ .-1, data = mlSet_log)
+```
+
+
+*Create Test and Train set*
+```{r}
+#force the random number seed so this is repeatable - would remove this in production 
+set.seed(3456)
+
+#shuffle the dataset  
+n <- nrow(mlSet_matrix)
+shuffled_mlSet_matrix <- mlSet_matrix[sample(n), ]
+
+#split it into train and test set (70/30) using a function
+train_indices <- 1:round(0.7 * n)
+train_trans <- shuffled_mlSet_matrix[train_indices, ]
+test_indices <- (round(0.7 * n) + 1):n
+test_trans <- shuffled_mlSet_matrix[test_indices, ]
+
+dim(train_trans)
+dim(test_trans)
+
+```
+
+
+
+*Extreme Gradient Boosting*
+===
+Not sure this is needed as we've done it earlier
+```{r}
+#####  Remove columns with NA, use test data as referal for NA
+cols.without.na = colSums(is.na(train_trans)) == 0
+train_trans = train_trans[, cols.without.na]
+
+cols.without.na = colSums(is.na(test_trans)) == 0
+test_trans = test_trans[, cols.without.na]
+```
+
+
+*Check for features’s variance*
+
+Based on the principal component analysis PCA, it is important that features have maximum variance for maximum uniqueness, so that each feature is as distant as possible (as orthogonal as possible) from the other features.  This helps us get rid of attributes that don't add much to the models accuracy but all take time to process.
+```{r}
+# check for zero variance - switch 'saveMetrics' to TRUE if you want to take a look at the output, otherwise the output will just be the indicies of the columns that have nearZeroVariance.
+zero.var = nearZeroVar(train_trans, saveMetrics=FALSE)
+zero.var
+
+#remove any columns where the data in the has near zero variance.  They wont add any value to the model.
+train_trans<-train_trans[,-zero.var]
+test_trans<-test_trans[, -zero.var]
+```
+
+*Explore Data*
+```{r}
+explore_train_df <- as.data.frame(as.matrix(train_trans)) 
+
+explore_train_df  %>% 
+ggplot(aes(freq)) + geom_histogram(aes(fill = ..count..),bins=40)  
+ggtitle('Distribution of Response Variable Y')
+```
+This shows us that the data is right skewed.  Not clear what we need to take the log of to deskew it.
+
+
+
+
+*Build machine learning model*
+===
+Now build a machine learning model to predict faults (freq) from the data (the features or predictors) by using XGBoost extreme gradient boosting algorithm.
+
+*Format data for XGBoost*
+XGBoost supports only numeric matrix data. Converting all training, testing and outcome data to matrix.
+
+```{r}
+# remove the outcome column (we dont want to give the model the answers and then convert the data to matrix.
+train_transtemp <- train_trans
+train_transtemp[,'freq'] <- c(NA)
+
+#dont think we need this step as the data is already a matrix
+train_trans.matrix = train_transtemp
+#train_trans.matrix = as.matrix(train_transtemp)
+#mode(train_trans.matrix) = "numeric"
+
+test_trans.matrix = test_trans
+#test_trans.matrix = as.matrix(test_trans)
+#mode(test_trans.matrix) = "numeric"
+
+#convert the target outcome value into a matrix so xgb can use it
+y = as.matrix(as.integer(unlist(train_trans[,"freq"])))
+```
+
+*Setup XGBoost parameters*
+Set XGBoost parameters for cross validation and training.
+Set a multiclass classification objective as the gradient boosting’s learning function.
+Set evaluation metric to RMSE (the measure of how good our model is for regression models)
+```{r}
+#Set seed for reproducability
+set.seed(1234)
+
+#See here for more details on the parameters
+#https://github.com/dmlc/xgboost/blob/master/doc/parameter.md
+
+# xgboost parameters
+xbg_params <- list("objective" = "reg:linear",    # default - linear regression
+              "eval_metric" = "rmse",    # evaluation metric 
+              #"nthread" = 8,   # number of threads to be used - default is max available
+              "max_depth" = 6,    # max depth of tree.  Default 6 Increase value will make the model complex / likely overfitting
+              "alpha" = 0.6,
+              "lambda" = 1.4,
+              "eta" = 0.007,    # step size shrinkage - 0.3 default
+              "gamma" = 0,    # minimum loss reduction - 0 default
+              "subsample" = 1,    # part of data instances to grow tree - 1 default
+              "colsample_bytree" = 1  # subsample ratio of columns when constructing each tree - 1 default 1
+          )
+
+#nrounds = 30, lambda = 1.4, alpha = 0.6, eta = 0.007
+
+
+#User Cross Validation checking to spot when our model starts to overfit.  The train RMSE will keep dropping but the test wont.
+#Thats how we spot overfitting.
+nround.cv = 300
+system.time( bst.cv <- xgb.cv(param=xbg_params, data=train_trans.matrix, label=y, 
+              nfold=7, nrounds=nround.cv, prediction=TRUE, verbose=FALSE) )
+```
+
+
+Plot the RMSE for training and test samples - where these two diverge is the maximum number of iterations we should run our model for, otherwise it will start to overfit.
+```{r}
+bst.cv$evaluation_log %>%
+  select(-contains("std")) %>%
+  gather(TestOrTrain, rmse,-iter) %>%
+  ggplot(aes(x = iter, y = rmse, group = TestOrTrain, color = TestOrTrain)) + 
+  geom_line() + 
+  theme_bw()
+
+#Get the details of our best iteration
+col.names<-colnames(bst.cv$evaluation_log)
+setnames(bst.cv$evaluation_log, old = col.names, new = c("iter","train.rmse.mean","train.rmse.std","test.rmse.mean","test.rmse.std" ))
+
+#Get index of minimum rmse
+min.rmse.idx = which.min(bst.cv$evaluation_log[, test.rmse.mean]) 
+min.rmse.idx 
+
+#Get details of mimimum rmse iteration
+bst.cv$dt=bst.cv$evaluation_log
+bst.cv$dt[min.rmse.idx,]
+```
+
+*Actually Train our model*
+*Model training*
+Fit the XGBoost gradient boosting model on all of the training data.
+```{r}
+# real model fit training, with full data
+system.time( xgb_model <- xgboost(param=xbg_params, data=train_trans.matrix, label=y, 
+                           nrounds=min.rmse.idx, verbose=0) )
+
+```
+
+*Make predictions for the testing data*
+```{r}
+# xgboost predict test data using the trained model
+pred <- predict(xgb_model, test_trans.matrix)  
+head(pred, 10)  
+```
+
+*Look at Feature importance* - which attributes does our model think are important
+```{r}
+# get the trained model
+model = xgb.dump(xgb_model, with_stats=TRUE)
+# get the feature real names
+names = dimnames(train_trans.matrix)[[2]]
+# compute feature importance matrix
+importance_matrix = xgb.importance(names, model=xgb_model)
+
+# plot
+gp = xgb.plot.importance(importance_matrix)
+print(gp) 
+```
+
+*Join the predictions to the original data set and see how well we did*
+```{r}
+#turn our predictions back into a data frame
+df <- data.frame(matrix(unlist(pred), nrow=nrow(test_trans), byrow=T),stringsAsFactors=FALSE)
+test_trans_df <- as.data.frame(as.matrix(test_trans)) 
+```
+
+```{r}
+#make a dataframe that contains all the original training data and the predicted score
+xbgNewResults <- data.frame(test_trans_df, prediction = df[1])
+#xbgNewResults <- data.frame(test_trans_df, prediction = exp(df[1]))
+colnames(xbgNewResults)[ncol(xbgNewResults)] <- "prediction"
+xbgNewResults$RoundedPrediction <- round(xbgNewResults$prediction,digits=0)
+xbgNewResults
+```
+
+```{r}
+rmse(xbgNewResults$freq, xbgNewResults$prediction)
+rmse(xbgNewResults$freq, xbgNewResults$RoundedPrediction)
+cat("Percentage Wrong ", length(which(xbgNewResults$freq != xbgNewResults$RoundedPrediction)) / nrow(xbgNewResults)*100, "%")
+
+cat("Actual Faults ", sum(xbgNewResults$freq))
+cat("Predicted Faults ", sum(xbgNewResults$RoundedPrediction))
+```
+
+
+
+
+
+
+Random Experiments
+===
+
+XGB from Caret 
+===
+
+```{r}
+myControl = trainControl(method = "cv", number = 5, verboseIter = TRUE)
+
+model_xgb4 = train(freq ~ ., 
+                   data = as.data.frame(as.matrix(train_trans)),
+                   tuneLength = 2,
+                   method = "xgbLinear",
+                   control = "myControl"
+                   )
+```
+
+```{r}
+#5 fold cross validation
+myControl = trainControl(method = "cv", number = 5)
+
+#xbg_params <- list("objective" = "reg:linear",    # default - linear regression
+#              "eval_metric" = "rmse",    # evaluation metric 
+#              #"nthread" = 8,   # number of threads to be used - default is max available
+#              "max_depth" = 6,    # max depth of tree. Default 6 Increase value will make the model complex / #likely overfitting
+#              "eta" = 0.01,    # step size shrinkage - 0.3 default
+#              "gamma" = 0,    # minimum loss reduction - 0 default
+#              "subsample" = 1,    # part of data instances to grow tree - 1 default
+#              "colsample_bytree" = 1  # subsample ratio of columns when constructing each tree - 1 default 1
+#          )
+
+#generate a set of all combinations - this was our original
+#'c' is a list of absolute values
+#'seq' generates a sequence of numbers between the first parameter and the second, using sets of the third.
+#xgbTuningGrid = expand.grid(nrounds = c(50, 100, 1000, 1500), 
+#                            lambda = seq(0.1, 1.0, 0.1), 
+#                            alpha = seq(0.1, 1.5, 0.1),
+#                            eta = c(0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5))
+
+#This was our second attempt
+#xgbTuningGrid = expand.grid(nrounds = c(50, 60, 70, 100, 1000), 
+#                            lambda = seq(0.2, 1.0, 0.2), 
+#                            alpha = seq(0, 1.6, 0.2),
+#                            eta = c(0.01, 0.02, 0.1, 0.3))
+
+#xgbTuningGrid = expand.grid(nrounds = c(30,40, 50), 
+#                            lambda = seq(1.0, 1.5, 0.1), 
+#                            alpha = seq(0.4, 1.6, 0.2),
+#                            eta = c(0.007, 0.008, 0.009, 0.01))
+
+#xgbTuningGrid = expand.grid(nrounds = c(50,200,300), 
+#                            lambda = seq(0.1, 1.0, 0.1), 
+#                            alpha = seq(0.1, 1.5, 0.5),
+#                            eta = c(0.001, 0.01, 0.03))
+
+xgbTuningGrid = expand.grid(nrounds = c(50, 100), 
+                            lambda = seq(0.1, 0.5, 0.1), 
+                            alpha = seq(0.1, 0.5, 0.1),
+                            eta = c(0.3, 0.4))
+
+
+xgbTuningGrid
+```
+
+```{r}
+
+# xgboost parameters
+#xbg_params <- list("objective" = "reg:linear",    # default - linear regression
+#              "eval_metric" = "rmse",    # evaluation metric 
+#              #"nthread" = 8,   # number of threads to be used - default is max available
+#              "max_depth" = 6,    # max depth of tree.  Default 6 Increase value will make the model #complex / likely overfitting
+#              "eta" = 0.3,    # step size shrinkage - 0.3 default
+#              "gamma" = 0,    # minimum loss reduction - 0 default
+#              "subsample" = 1,    # part of data instances to grow tree - 1 default
+#              "colsample_bytree" = 1  # subsample ratio of columns when constructing each tree - 1 #default 1
+#          )
+
+xbg_params <- list("objective" = "reg:linear",    # default - linear regression
+              "eval_metric" = "rmse",    # evaluation metric 
+              #"nthread" = 8,   # number of threads to be used - default is max available
+              "max_depth" = 6,    # max depth of tree.  Default 6 Increase value will make the model complex / likely overfitting
+              "eta" = 0.01,    # step size shrinkage - 0.3 default
+              "gamma" = 0,    # minimum loss reduction - 0 default
+              "subsample" = 1,    # part of data instances to grow tree - 1 default
+              "colsample_bytree" = 1  # subsample ratio of columns when constructing each tree - 1 default 1
+          )
+
+myControl = trainControl(method = "cv", number = 5, verboseIter = FALSE)
+
+model_xgb4g = train(freq ~ ., 
+                   data = as.data.frame(as.matrix(train_trans)),
+                   tuneLength = 3,
+                   method = "xgbLinear",
+                   trControl = myControl,
+                   tuneGrid = xgbTuningGrid,
+                   verbose = FALSE)
+
+```
+
+```{r}
+trellis.par.set(caretTheme())
+plot(model_xgb4g)
+
+model_xgb4g$results
+#this is easier to read
+ggplot(model_xgb4g)  
+#filter by lambda=.08 or lambda=1
+```
+
+```{r}
+# get the top model and its results
+head(model_xgb4g$results[with(model_xgb4g$results, 
+                             order(RMSE)), ], 1)
+ 
+yhatXgb <- predict(model_xgb4g, newdata = as.data.frame(as.matrix(test_trans)))
+mean((yhatXgb - as.data.frame(as.matrix(test_trans))$freq) ^ 2) # 15.49
+ 
+plot(as.data.frame(as.matrix(test_trans))$freq, yhatXgb, col = "red")
+abline(0, 1, col = "blue")
+ 
+# Variable Importance
+names <- names(as.data.frame(as.matrix(train_trans)))[! names(as.data.frame(as.matrix(train_trans))) %in% c("freq")]
+importanceMatrix <- xgb.importance(names, 
+                                   model = model_xgb4g$finalModel)
+xgb.plot.importance(importanceMatrix[1:10,])
+```
+
+```{r}
+#GET THE NICE GRAPH
+#User Cross Validation checking to spot when our model starts to overfit.  The train RMSE will keep dropping but the test wont.
+#Thats how we spot overfitting.
+nround.cv = 300
+system.time( bst.cv <- xgb.cv(param=xbg_params, data=train_trans.matrix, label=y, 
+              nfold=4, nrounds=nround.cv, prediction=TRUE, verbose=FALSE) )
+
+bst.cv$evaluation_log %>%
+  select(-contains("std")) %>%
+  gather(TestOrTrain, rmse,-iter) %>%
+  ggplot(aes(x = iter, y = rmse, group = TestOrTrain, color = TestOrTrain)) + 
+  geom_line() + 
+  theme_bw()
+
+#Get the details of our best iteration
+col.names<-colnames(bst.cv$evaluation_log)
+setnames(bst.cv$evaluation_log, old = col.names, new = c("iter","train.rmse.mean","train.rmse.std","test.rmse.mean","test.rmse.std" ))
+
+#Get index of minimum rmse
+min.rmse.idx = which.min(bst.cv$evaluation_log[, test.rmse.mean]) 
+min.rmse.idx 
+
+#Get details of mimimum rmse iteration
+bst.cv$dt=bst.cv$evaluation_log
+bst.cv$dt[min.rmse.idx,]
+```
+
+
+*Actually Train our model*
+*Model training*
+Fit the XGBoost gradient boosting model on all of the training data.
+
+
+```{r}
+# real model fit training, with full data
+system.time( xgb_model <- xgboost(param=xbg_params, data=train_trans.matrix, label=y, 
+                           nrounds=min.rmse.idx, verbose=0) )
+```
+
+*Make predictions for the testing data*
+```{r}
+# xgboost predict test data using the trained model
+pred <- predict(xgb_model, test_trans.matrix)  
+head(pred, 10)  
+```
+
+*Look at Feature importance* - which attributes does our model think are important
+```{r}
+# get the trained model
+model = xgb.dump(xgb_model, with_stats=TRUE)
+# get the feature real names
+names = dimnames(train_trans.matrix)[[2]]
+# compute feature importance matrix
+importance_matrix = xgb.importance(names, model=xgb_model)
+
+# plot
+gp = xgb.plot.importance(importance_matrix)
+print(gp) 
+```
+
+*Join the predictions to the original data set and see how well we did*
+```{r}
+#turn our predictions back into a data frame
+df <- data.frame(matrix(unlist(pred), nrow=nrow(test_trans), byrow=T),stringsAsFactors=FALSE)
+test_trans_df <- as.data.frame(as.matrix(test_trans)) 
+```
+
+```{r}
+#make a dataframe that contains all the original training data and the predicted score
+#xbgNewResults <- data.frame(y, freq = df[1])
+xbgNewResults <- data.frame(test_trans_df, prediction = df[1])
+colnames(xbgNewResults)[ncol(xbgNewResults)] <- "prediction"
+xbgNewResults$RoundedPrediction <- round(xbgNewResults$prediction,digits=0)
+xbgNewResults
+```
+
+```{r}
+rmse(xbgNewResults$freq, xbgNewResults$prediction)
+rmse(xbgNewResults$freq, xbgNewResults$RoundedPrediction)
+cat("Percentage Wrong ", length(which(xbgNewResults$freq != xbgNewResults$RoundedPrediction)) / nrow(xbgNewResults)*100, "%")
+
+cat("Actual Faults ", sum(xbgNewResults$freq))
+cat("Predicted Faults ", sum(xbgNewResults$RoundedPrediction))
+```
+
+
